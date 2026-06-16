@@ -815,7 +815,7 @@ with st.sidebar:
 # 品牌头部
 st.markdown(f'<div class="brand-header"><div><div class="brand-title">🎮 LagoFast 游戏分析辅助</div><div class="brand-subtitle">Steam 玩家评论挖掘 · 需求发现 · 竞品分析 · 推广策略 | {datetime.now().strftime("%Y-%m-%d %H:%M")}</div></div><div style="text-align:right;color:#8b949e;font-size:13px;">AppID: <span style="color:#58a6ff;font-weight:600;">{app_id or "未设置"}</span><br>语言: <span style="color:#3fb950;">{len(selected_langs)} 种</span> | AI: <span style="color:#d29922;">DeepSeek</span></div></div>', unsafe_allow_html=True)
 st.markdown('<div class="notice-box">⚠️ 该AI工具输出结论仅做辅助参考，请结合实际业务判断</div>', unsafe_allow_html=True)
-st.markdown('<div class="info-box">📌 工具说明：仅针对 Steam 有评论数据的单机游戏进行分析；该工具使用实时数据，每次查询结果可能存在差异；该工具输出内容仅辅助参考，请结合业务实际情况进行决策。</div>', unsafe_allow_html=True)
+st.markdown('<div class="info-box">📌 工具说明：仅针对 Steam 有评论数据的游戏进行分析；该工具使用实时数据，每次查询结果可能存在差异；该工具输出内容仅辅助参考，请结合业务实际情况进行决策。</div>', unsafe_allow_html=True)
 
 # 抓取逻辑
 if start_btn:
@@ -1139,7 +1139,7 @@ with tab2:
                 st.session_state.ai_results["tools"] = call_ai(
                     f"""角色：你是一位资深的 Steam 游戏数据分析师与LagoFast游戏辅助工具软件的产品经理。
 任务：请分析以下 Excel 导出的 Steam 多语言玩家评论数据，忽略单纯宣泄情绪的无意义字眼，聚焦于玩家的“真实需求”与“痛点”。
-LagoFast是什么：LagoFast是一款以开发steam单机游戏修改器功能为主，针对游戏需求研发相关所需工具（比如游戏翻译、互动资源地图、闪退修复，需分析玩家痛点和需求研发新工具）集合为一体的软件
+LagoFast是什么：LagoFast是一款以steam游戏加速和功能开发为主，针对游戏需求研发相关所需工具（比如游戏翻译、互动资源地图、闪退修复，需分析玩家痛点和需求研发新工具）集合为一体的软件
 
 分析维度要求：
 1. 【语言与地区痛点】：不同语区（如俄语、英语、中文）玩家反映的集中问题是什么？是否存在特定地区的网络、本地化（翻译质量）问题？
@@ -1147,7 +1147,7 @@ LagoFast是什么：LagoFast是一款以开发steam单机游戏修改器功能�
 3. 【玩法内容资源稀缺性】：玩家抱怨最多的游戏内容是什么？（例如：中后期资源太匮乏、某 Boss 难度不合理、缺乏某项功能指引、缺乏联机模式等）。
 
 输出格式：
-请以结构清晰的 Markdown 表格和条目化建议输出专项工具报告，并在最后按问题反馈数量从大到小提炼出“Top 5工具需求列表”（按需求优先级排序），每一条工具需求必须以实际的用户评论为依据，并引用完整的用户评论原话，需求分析必须以单机游戏为前提，仅对单机游戏进行分析；你可以发挥创意和想象，根据真实的玩家评论输出新的工具需求，包括但不限于游戏翻译、互动资源地图、闪退修复等工具。
+请以结构清晰的 Markdown 表格和条目化建议输出专项工具报告，并在最后按问题反馈数量从大到小提炼出“Top 5工具需求列表”（按需求优先级排序），每一条工具需求必须以实际的用户评论为依据，并引用完整的用户评论原话，需求分析必须以游戏为前提，仅对游戏进行分析；你可以发挥创意和想象，根据真实的玩家评论输出新的工具需求，包括但不限于游戏翻译、互动资源地图、闪退修复等工具。
 
 数据来源：
 根据Tab1中获取到的游戏评论全量文本进行分析
@@ -1178,7 +1178,7 @@ with tab3:
         slc = st.session_state.supported_lang_codes or set()
         st.markdown("#### 📣 推广策略辅助")
         st.markdown('<div class="info-box">基于 Tab1/Tab2 数据，给出各语言地区推广重点</div>', unsafe_allow_html=True)
-        st.markdown('<div class="notice-box">📌 本工具专注于单机游戏/游戏单机模式的相关功能推广</div>', unsafe_allow_html=True)
+        st.markdown('<div class="notice-box">📌 本工具专注于游戏模式的相关功能推广</div>', unsafe_allow_html=True)
         dv = df[df["总评论数"]>0].head(13)
         if len(dv) > 0:
             fp = go.Figure()
