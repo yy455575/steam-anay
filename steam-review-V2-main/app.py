@@ -18,12 +18,23 @@ import re
 from datetime import datetime
 from io import BytesIO
 
+from steam_intel.country_metrics import CountryDistribution, MetricStatus
+from wishlist_tools import (
+    fetch_gamalytic_active_users_regions,
+    fetch_gamalytic_game_details,
+    fetch_gamalytic_wishlist_country_distribution,
+    fetch_popular_wishlist_apps,
+    gamalytic_country_data_frame,
+    gamalytic_summary_frame,
+    search_steam_games,
+)
+
 # ============================================================
 # 常量配置
 # ============================================================
-PAGE_PASSWORD = "LagoFast666"
-# 默认不使用代理，避免无效代理字符串导致请求初始化失败
-FIXED_PROXY = "http://7651097f5ffe3bfb7c36:5ddcc41bf63a2743@gw.dataimpulse.com:823"
+PAGE_PASSWORD = os.environ.get("LAGOFAST_PAGE_PASSWORD", "")
+# 代理凭据只从运行环境读取，禁止提交到源码或导出文件。
+FIXED_PROXY = os.environ.get("LAGOFAST_PROXY", "")
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -177,7 +188,7 @@ def show_login_page():
         st.markdown("### 🔐 请输入访问密码")
         pwd_input = st.text_input("访问密码", type="password", placeholder="请输入访问密码...", key="pwd_input")
         if st.button("进入系统", type="primary"):
-            if pwd_input == PAGE_PASSWORD:
+            if PAGE_PASSWORD and pwd_input == PAGE_PASSWORD:
                 st.session_state["authenticated"] = True
                 st.rerun()
             else:
@@ -336,31 +347,31 @@ def _load_local_secrets_toml():
     except Exception:
         return {}
 
+def _load_streamlit_secrets():
+    app_secrets = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
+    user_secrets = Path.home() / ".streamlit" / "secrets.toml"
+    if not app_secrets.is_file() and not user_secrets.is_file():
+        return {}
+    try:
+        return st.secrets
+    except Exception:
+        return {}
+
 def get_deepseek_api_key():
     """读取 DeepSeek API Key：环境变量 → Streamlit Secrets → 本地 secrets.toml"""
     key = _coalesce_api_key(os.environ.get("DEEPSEEK_API_KEY"))
     if key:
         return key
-    try:
-        key = _coalesce_api_key(st.secrets.get("DEEPSEEK_API_KEY"))
+    secrets = _load_streamlit_secrets()
+    if secrets:
+        key = _coalesce_api_key(secrets.get("DEEPSEEK_API_KEY"))
         if key:
             return key
-    except Exception:
-        pass
-    try:
-        key = _coalesce_api_key(st.secrets["DEEPSEEK_API_KEY"])
-        if key:
-            return key
-    except Exception:
-        pass
-    try:
-        block = st.secrets.get("deepseek", {})
+        block = secrets.get("deepseek", {})
         if hasattr(block, "get"):
             key = _coalesce_api_key(block.get("api_key") or block.get("API_KEY"))
             if key:
                 return key
-    except Exception:
-        pass
     local = _load_local_secrets_toml()
     key = _coalesce_api_key(local.get("DEEPSEEK_API_KEY"))
     if key:
@@ -636,6 +647,562 @@ def dataframe_to_excel_bytes(df, sheet_name="数据导出"):
     output.seek(0)
     return output.getvalue()
 
+def render_global_wishlist_tab():
+    st.markdown("#### 💙 Steam 全站愿望单榜单")
+    st.markdown(
+        '<div class="info-box">这里抓取 Steam 商店公开的 popularwishlist 榜单，适合做全站热门未发售游戏、竞品热度和选题方向分析。Steam 不公开全站真实愿望单数量，因此这里展示的是公开排名，不是真实 wishlist count。</div>',
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        limit = st.selectbox("抓取数量", [10, 20, 30, 50, 100, 200, 300, 500], index=0, key="global_wishlist_limit")
+    with c2:
+        country = st.selectbox("商店地区", ["ALL", "US", "CN", "JP", "KR", "DE", "FR", "GB"], index=0, key="global_wishlist_country")
+    with c3:
+        st.caption("榜单来自 Steam Store 公开搜索筛选 popularwishlist；数量越大请求越久。")
+
+    if st.button("抓取 Steam 全站愿望单榜单", type="primary", key="btn_fetch_global_wishlist"):
+        with st.spinner("正在抓取 Steam popularwishlist 榜单..."):
+            try:
+                df, total_count = fetch_popular_wishlist_apps(limit=limit, country=country)
+                st.session_state.global_wishlist_df = df
+                st.session_state.global_wishlist_total = total_count
+                if df.empty:
+                    st.warning("没有抓取到榜单数据，请稍后重试或检查网络。")
+                else:
+                    st.success(f"成功获取 Top {len(df)}，Steam 当前公开榜单总量约 {total_count:,} 个条目")
+            except Exception as exc:
+                st.error(f"全站愿望单榜单抓取失败：{exc}")
+
+    df = st.session_state.get("global_wishlist_df")
+    total_count = st.session_state.get("global_wishlist_total", 0)
+    if df is None or df.empty:
+        st.markdown('<div class="info-box">点击抓取后，会展示 Steam 全站愿望单排名、Top 游戏、发售状态和导出表格。</div>', unsafe_allow_html=True)
+        render_single_game_distribution_section()
+        return
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        render_kpi_card("已抓取条目", f"{len(df):,}", "公开榜单 Top N")
+    with k2:
+        render_kpi_card("榜单总量", f"{int(total_count):,}" if total_count else "N/A", "Steam 返回 total_count")
+    with k3:
+        top_name = df.iloc[0]["游戏名称"] if len(df) else "N/A"
+        render_kpi_card("榜首游戏", top_name, f"AppID {df.iloc[0]['AppID']}" if len(df) else "")
+    with k4:
+        tba_count = int(df["发售状态/日期"].astype(str).str.contains("announce|soon|coming|待定|即将", case=False, na=False).sum())
+        render_kpi_card("未定/即将发售", f"{tba_count:,}", "按发售文本粗略判断")
+
+    st.markdown("---")
+    top_chart = df.head(25).copy()
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=(top_chart["愿望单排名"].max() + 1 - top_chart["愿望单排名"]),
+                y=top_chart["游戏名称"],
+                orientation="h",
+                marker_color="#58a6ff",
+                text=top_chart["愿望单排名"].map(lambda x: f"#{x}"),
+                textposition="auto",
+            )
+        ]
+    )
+    layout = get_plotly_layout("Steam 全站愿望单 Top25（排名越靠前热度越高）")
+    layout.update(height=620, yaxis=dict(autorange="reversed", color="#8b949e"), xaxis=dict(visible=False))
+    fig.update_layout(**layout)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("#### 📋 全站愿望单榜单明细")
+    display_cols = ["愿望单排名", "AppID", "游戏名称", "发售状态/日期", "评价摘要", "平台", "商店链接"]
+    display_df = df[[c for c in display_cols if c in df.columns]].copy()
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        height=520,
+        column_config={
+            "商店链接": st.column_config.LinkColumn("商店链接"),
+        },
+    )
+
+    st.download_button(
+        "下载全站愿望单榜单 Excel",
+        dataframe_to_excel_bytes(display_df, sheet_name="Steam全站愿望单榜单"),
+        f"steam_global_wishlist_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_global_wishlist_excel",
+    )
+
+    st.markdown(
+        '<div class="warning-box">说明：Gamalytic 这类站点展示的 wishlist 数量通常来自私有模型或第三方估算。Steam 公开页面能提供全站排名，但不能提供每个游戏真实愿望单人数。</div>',
+        unsafe_allow_html=True,
+    )
+    render_single_game_distribution_section()
+
+
+def render_wishlist_region_interest_section(base_df):
+    st.markdown("---")
+    st.markdown("#### 🌐 愿望单区域兴趣分布")
+    st.markdown(
+        '<div class="info-box">对多个 Steam 商店地区的 popularwishlist 榜单做交叉排名，估算每个游戏在哪些地区更受愿望单用户关注。它是公开排名代理，不是真实 wishlister 国家占比。</div>',
+        unsafe_allow_html=True,
+    )
+    regions = st.multiselect(
+        "对比地区",
+        ["US", "CN", "JP", "KR", "DE", "FR", "GB", "BR", "RU", "TR"],
+        default=["US", "CN", "JP", "KR", "DE", "FR", "GB"],
+        key="wishlist_interest_regions",
+    )
+    limit_per_region = st.selectbox("每个地区抓取 Top N", [10, 20, 30, 50, 100, 200, 300, 500], index=0, key="wishlist_interest_limit")
+    if st.button("计算愿望单区域兴趣", key="btn_wishlist_region_interest"):
+        with st.spinner("正在抓取多地区 wishlist 榜单并计算兴趣占比..."):
+            try:
+                long_df, wide_df = fetch_regional_wishlist_interest(regions=regions, limit_per_region=limit_per_region)
+                st.session_state.wishlist_region_interest_long = long_df
+                st.session_state.wishlist_region_interest_wide = wide_df
+                if wide_df.empty:
+                    st.warning("没有得到区域兴趣数据，请减少地区或稍后重试。")
+                else:
+                    st.success(f"完成：覆盖 {len(wide_df):,} 个游戏，{len(regions)} 个地区")
+            except Exception as exc:
+                st.error(f"区域兴趣计算失败：{exc}")
+
+    wide_df = st.session_state.get("wishlist_region_interest_wide")
+    long_df = st.session_state.get("wishlist_region_interest_long")
+    if wide_df is None or wide_df.empty:
+        return
+
+    st.dataframe(wide_df.head(100), use_container_width=True, height=420)
+    signal_df = wide_df[wide_df.get("区域信号状态", "") == "有地区差异"].copy() if "区域信号状态" in wide_df.columns else wide_df
+    if signal_df.empty:
+        st.warning("当前 Steam 公开 popularwishlist 榜单在所选地区没有排名差异，因此无法计算真实有效的区域市场占比。这里不能把相同榜单硬算成各地区均分。")
+        return
+
+    top = signal_df.head(20)
+    region_cols = [c for c in top.columns if c not in ["AppID", "游戏名称", "覆盖地区数", "总兴趣分", "地区排名差异数", "区域信号状态"]]
+    if region_cols:
+        fig = go.Figure()
+        for col in region_cols:
+            fig.add_trace(go.Bar(name=col, x=top["游戏名称"], y=top[col]))
+        layout = get_plotly_layout("Top20 游戏愿望单区域兴趣占比")
+        layout.update(height=460, barmode="stack", xaxis=dict(tickangle=-35, color="#8b949e"))
+        fig.update_layout(**layout)
+        st.plotly_chart(fig, use_container_width=True)
+
+    if long_df is not None and not long_df.empty:
+        st.download_button(
+            "下载愿望单区域兴趣 Excel",
+            dataframe_to_excel_bytes(wide_df, sheet_name="愿望单区域兴趣"),
+            f"wishlist_region_interest_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_wishlist_region_interest",
+        )
+
+
+def render_purchase_region_estimate_section(base_df):
+    st.markdown("---")
+    st.markdown("#### 🧭 购买玩家区域估算")
+    st.markdown(
+        '<div class="info-box">抓取榜单游戏的 Steam 购买评论语言 summary，用语言市场作为购买玩家区域代理。它更接近“购买用户评论样本分布”，不等同于真实销售地区。</div>',
+        unsafe_allow_html=True,
+    )
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        top_n = st.selectbox("分析榜单前 N 个游戏", [1, 3, 5, 10, 20, 30], index=3, key="purchase_region_top_n")
+        purchase_type = st.selectbox("评论购买口径", ["all", "steam", "non_steam_purchase"], index=0, key="purchase_region_purchase_type")
+    with c2:
+        languages = st.multiselect(
+            "评论语言市场",
+            ["english", "schinese", "tchinese", "japanese", "koreana", "russian", "german", "french", "spanish", "latam", "brazilian", "turkish", "thai", "vietnamese", "polish", "italian"],
+            default=["english", "schinese", "japanese", "koreana", "russian", "german", "french", "spanish", "brazilian"],
+            key="purchase_region_languages",
+        )
+    if st.button("估算购买玩家区域", key="btn_purchase_region_estimate"):
+        with st.spinner("正在抓取 Steam 购买评论语言 summary..."):
+            try:
+                long_df, wide_df = fetch_purchase_language_distribution(base_df, languages=languages, top_n=top_n, purchase_type=purchase_type)
+                st.session_state.purchase_region_long = long_df
+                st.session_state.purchase_region_wide = wide_df
+                if wide_df.empty:
+                    st.warning("没有得到购买玩家区域估算数据。未发售游戏或评论很少的游戏通常没有足够样本。")
+                else:
+                    st.success(f"完成：分析 {len(wide_df):,} 个游戏，{len(languages)} 个语言市场")
+            except Exception as exc:
+                st.error(f"购买玩家区域估算失败：{exc}")
+
+    wide_df = st.session_state.get("purchase_region_wide")
+    if wide_df is None or wide_df.empty:
+        return
+
+    st.dataframe(wide_df, use_container_width=True, height=420)
+    market_cols = [c for c in wide_df.columns if c not in ["愿望单排名", "AppID", "游戏名称", "购买评论总样本"]]
+    chart_df = wide_df[wide_df["购买评论总样本"] > 0].head(15)
+    if not chart_df.empty and market_cols:
+        fig = go.Figure()
+        for col in market_cols:
+            fig.add_trace(go.Bar(name=col, x=chart_df["游戏名称"], y=chart_df[col]))
+        layout = get_plotly_layout("购买玩家区域估算占比（Steam 购买评论语言代理）")
+        layout.update(height=460, barmode="stack", xaxis=dict(tickangle=-35, color="#8b949e"))
+        fig.update_layout(**layout)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.download_button(
+        "下载购买玩家区域估算 Excel",
+        dataframe_to_excel_bytes(wide_df, sheet_name="购买玩家区域估算"),
+        f"purchase_region_estimate_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_purchase_region_estimate",
+    )
+
+
+def _render_country_distribution(result: CountryDistribution, value_label: str, title: str, color: str) -> None:
+    st.markdown(f"##### {title}")
+    if not result.available:
+        state_labels = {
+            MetricStatus.FORBIDDEN: "无权限",
+            MetricStatus.RATE_LIMITED: "请求受限",
+            MetricStatus.SCHEMA_CHANGED: "等待接口契约验证",
+            MetricStatus.INVALID_DATA: "数据校验失败",
+            MetricStatus.UNAVAILABLE: "暂不可用",
+        }
+        st.info(f"{state_labels.get(result.status, '暂不可用')}：{result.message}")
+        return
+
+    frame = result.to_frame(value_label)
+    st.dataframe(frame, use_container_width=True, hide_index=True)
+    figure = go.Figure(
+        data=[
+            go.Bar(
+                x=frame["国家/地区"],
+                y=frame[value_label],
+                marker_color=color,
+                text=frame[value_label].map(lambda value: f"{value:.1f}%"),
+                textposition="auto",
+            )
+        ]
+    )
+    layout = get_plotly_layout(title)
+    layout.update(height=400, xaxis=dict(tickangle=-35, color="#8b949e"), yaxis=dict(range=[0, 100], color="#8b949e"))
+    figure.update_layout(**layout)
+    st.plotly_chart(figure, use_container_width=True)
+    if not result.is_complete:
+        st.caption(f"当前来源明确披露了 {result.reported_share_percent:.1f}% 的国家份额；未披露部分不会被自动拆分。")
+    st.caption(f"来源：{result.source} | 状态：{result.status} | UTC 抓取时间：{result.fetched_at:%Y-%m-%d %H:%M}")
+
+
+def render_single_game_distribution_section():
+    st.markdown("---")
+    st.markdown("#### 🔎 单个游戏市场数据")
+    st.markdown(
+        '<div class="info-box">先按名称搜索或直接输入 AppID。Players、Buyers、Wishlists 使用独立数据口径；没有经验证来源时会明确显示不可用，不会用榜单或评论语言代替。</div>',
+        unsafe_allow_html=True,
+    )
+
+    search_col, app_col = st.columns([2, 1])
+    with search_col:
+        search_query = st.text_input("搜索 Steam 游戏", placeholder="例如：Fable", key="market_game_search_query")
+        if st.button("搜索游戏", key="market_game_search_button"):
+            try:
+                st.session_state.market_game_search_results = search_steam_games(search_query)
+                st.session_state.market_game_search_error = ""
+            except Exception as exc:
+                st.session_state.market_game_search_results = pd.DataFrame()
+                st.session_state.market_game_search_error = str(exc)
+    with app_col:
+        st.caption("可直接查询数字 AppID")
+
+    search_results = st.session_state.get("market_game_search_results")
+    if st.session_state.get("market_game_search_error"):
+        st.warning(f"Steam 游戏搜索失败：{st.session_state.market_game_search_error}")
+    if search_results is not None and not search_results.empty:
+        st.dataframe(
+            search_results[[column for column in ["AppID", "游戏名称", "发售状态/日期", "商店链接"] if column in search_results.columns]],
+            use_container_width=True,
+            hide_index=True,
+        )
+        selected_app_id = st.selectbox(
+            "选择搜索结果",
+            search_results["AppID"].tolist(),
+            format_func=lambda app_id: f"{app_id} - {search_results.loc[search_results['AppID'] == app_id, '游戏名称'].iloc[0]}",
+            key="market_selected_search_app_id",
+        )
+        if st.button("使用选中的 AppID", key="market_use_selected_app_id"):
+            st.session_state.market_game_app_id = str(selected_app_id)
+
+    settings_col, key_col = st.columns([1, 1])
+    with settings_col:
+        app_id = st.text_input("游戏 AppID", placeholder="例如：2769570", key="market_game_app_id")
+    with key_col:
+        gamalytic_api_key = st.text_input(
+            "Gamalytic API Key（可选）",
+            type="password",
+            key="market_gamalytic_api_key",
+            help="仅用于有明确接口契约的授权端点；密钥不会显示在页面或诊断信息中。",
+        )
+
+    if st.button("加载游戏市场数据", type="primary", key="market_load_game"):
+        if not app_id.strip().isdigit():
+            st.error("请输入有效的数字 AppID，或先从搜索结果中选择游戏。")
+        else:
+            result: dict[str, object] = {"appid": app_id.strip(), "loaded_at": datetime.utcnow()}
+            try:
+                game_data = fetch_gamalytic_game_details(app_id.strip())
+                result["summary"] = gamalytic_summary_frame(game_data)
+                result["public_players"] = gamalytic_country_data_frame(game_data)
+                result["game_error"] = ""
+            except Exception as exc:
+                result["summary"] = pd.DataFrame()
+                result["public_players"] = pd.DataFrame()
+                result["game_error"] = str(exc)
+
+            if gamalytic_api_key.strip():
+                result["active_users"] = fetch_gamalytic_active_users_regions(app_id.strip(), gamalytic_api_key)
+                result["wishlists"] = fetch_gamalytic_wishlist_country_distribution(app_id.strip(), gamalytic_api_key)
+            else:
+                result["active_users"] = None
+                result["wishlists"] = None
+            st.session_state.market_game_result = result
+
+    result = st.session_state.get("market_game_result")
+    if not result:
+        return
+
+    if result.get("game_error"):
+        st.warning(f"游戏概览暂时不可用：{result['game_error']}")
+    summary = result.get("summary")
+    if isinstance(summary, pd.DataFrame) and not summary.empty:
+        st.markdown("##### 游戏概览（供应商估算）")
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+        st.caption("此概览来自公开 Gamalytic 页面接口，可能限流或变更；不作为国家分布的唯一来源。")
+
+    players_tab, buyers_tab, wishlists_tab, quality_tab = st.tabs(["Players", "Buyers", "Wishlists", "数据质量"])
+    with players_tab:
+        active_users = result.get("active_users")
+        if isinstance(active_users, CountryDistribution):
+            _render_country_distribution(active_users, "活跃用户占比(%)", "Active users by country", "#58a6ff")
+        else:
+            public_players = result.get("public_players")
+            if isinstance(public_players, pd.DataFrame) and not public_players.empty:
+                st.markdown("##### Players by country（公开 Top3 + 未披露剩余）")
+                st.dataframe(public_players, use_container_width=True, hide_index=True)
+                st.caption("公开 countryData 是玩家估算。除已披露国家外，其余份额只显示为未披露剩余，不能展开为 Top20。")
+            else:
+                st.info("没有可用的 Players 国家分布。可使用有权限的 active-users-regions，或稍后重试公开数据源。")
+
+    with buyers_tab:
+        st.info("全站 Buyers by country 需要授权的区域销售数据或经官方样本校准的模型。当前未接入可验证来源，因此不显示估算值。")
+
+    with wishlists_tab:
+        wishlist_result = result.get("wishlists")
+        if isinstance(wishlist_result, CountryDistribution):
+            _render_country_distribution(wishlist_result, "愿望单占比(%)", "Wishlists by country", "#3fb950")
+        else:
+            st.info("全站 Wishlists by country 需要经过字段验证的供应商数据；Steam 公共榜单不能推导此分布。")
+
+    with quality_tab:
+        active_users = result.get("active_users")
+        wishlist_result = result.get("wishlists")
+        quality_rows = [
+            {"指标": "Players（公开）", "状态": "estimated" if isinstance(result.get("public_players"), pd.DataFrame) and not result["public_players"].empty else "unavailable", "来源": "Gamalytic public countryData", "说明": "公开结果通常仅披露 Top3 + 未披露剩余"},
+            {"指标": "Active users", "状态": active_users.status if isinstance(active_users, CountryDistribution) else "not_requested", "来源": "Gamalytic active-users-regions", "说明": active_users.message if isinstance(active_users, CountryDistribution) else "未填写 API Key"},
+            {"指标": "Buyers", "状态": "unavailable", "来源": "需要区域销售数据", "说明": "评论语言与商店榜单不会被用作购买国家代理"},
+            {"指标": "Wishlists", "状态": wishlist_result.status if isinstance(wishlist_result, CountryDistribution) else "not_requested", "来源": "Gamalytic wishlist-insights", "说明": wishlist_result.message if isinstance(wishlist_result, CountryDistribution) else "未填写 API Key"},
+        ]
+        st.dataframe(pd.DataFrame(quality_rows), use_container_width=True, hide_index=True)
+
+
+def _legacy_render_single_game_distribution_section():
+    st.markdown("---")
+    st.markdown("#### 🔎 单个游戏 Gamalytic 区域查询")
+    st.markdown(
+        '<div class="info-box">输入 Steam AppID 后，公开数据只能展示 Players by country 的 Top3+Other；如果填写有 Pro 权限的 Gamalytic API Key，会优先读取 wishlist-insights 并展示愿望单国家分布 Top20 明细。</div>',
+        unsafe_allow_html=True,
+    )
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        single_app_id = st.text_input("单个游戏 AppID", placeholder="例如: 730", key="single_game_app_id")
+        single_purchase_type = st.selectbox("单游戏评论口径", ["all", "steam", "non_steam_purchase"], index=0, key="single_purchase_type")
+        single_scan_limit = st.selectbox("愿望单榜单扫描 Top N", [10, 20, 30, 50, 100, 200, 300, 500], index=0, key="single_wishlist_scan_limit")
+        gamalytic_api_key = st.text_input(
+            "Gamalytic API Key（可选，用于 Top20 国家分布）",
+            type="password",
+            key="single_gamalytic_api_key",
+            help="公开页面通常只返回 Top3+Other；Top20 玩家国家分布和愿望单国家分布需要 Gamalytic Pro API 权限。",
+        )
+    with c2:
+        single_regions = st.multiselect(
+            "单游戏愿望单地区",
+            ["US", "CN", "JP", "KR", "DE", "FR", "GB", "BR", "RU", "TR"],
+            default=["US", "CN", "JP", "KR", "DE", "FR", "GB"],
+            key="single_wishlist_regions",
+        )
+        single_languages = st.multiselect(
+            "单游戏评论语言市场",
+            ["english", "schinese", "tchinese", "japanese", "koreana", "russian", "german", "french", "spanish", "latam", "brazilian", "turkish", "thai", "vietnamese", "polish", "italian"],
+            default=["english", "schinese", "japanese", "koreana", "russian", "german", "french", "spanish", "brazilian"],
+            key="single_purchase_languages",
+        )
+
+    if st.button("查询单个游戏区域分布", key="btn_single_game_distribution"):
+        if not single_app_id.strip().isdigit():
+            st.error("请输入有效的数字 AppID。")
+        else:
+            with st.spinner("正在查询单个游戏的购买区域与愿望单区域信号..."):
+                gamalytic_data = None
+                try:
+                    gamalytic_data = fetch_gamalytic_game_details(single_app_id.strip())
+                    gamalytic_country_df = gamalytic_country_data_frame(gamalytic_data)
+                    gamalytic_summary_df = gamalytic_summary_frame(gamalytic_data)
+                    st.session_state.single_gamalytic_data = gamalytic_data
+                    st.session_state.single_gamalytic_country_df = gamalytic_country_df
+                    st.session_state.single_gamalytic_summary_df = gamalytic_summary_df
+                    st.session_state.single_gamalytic_error = ""
+                except Exception as exc:
+                    st.session_state.single_gamalytic_error = str(exc)
+                st.session_state.single_gamalytic_active_regions_df = None
+                st.session_state.single_gamalytic_wishlist_country_df = None
+                st.session_state.single_gamalytic_pro_error = ""
+                if gamalytic_api_key.strip():
+                    pro_errors = []
+                    try:
+                        st.session_state.single_gamalytic_active_regions_df = fetch_gamalytic_active_users_regions(
+                            single_app_id.strip(),
+                            gamalytic_api_key,
+                        )
+                    except Exception as exc:
+                        pro_errors.append(f"active-users-regions：{exc}")
+                    try:
+                        st.session_state.single_gamalytic_wishlist_country_df = fetch_gamalytic_wishlist_country_distribution(
+                            single_app_id.strip(),
+                            gamalytic_api_key,
+                        )
+                    except Exception as exc:
+                        pro_errors.append(f"wishlist-insights：{exc}")
+                    st.session_state.single_gamalytic_pro_error = "；".join(pro_errors)
+                app_df = app_row(single_app_id.strip())
+                purchase_long, purchase_wide = fetch_purchase_language_distribution(
+                    app_df,
+                    languages=single_languages,
+                    top_n=1,
+                    purchase_type=single_purchase_type,
+                )
+                wishlist_region_df = find_app_in_regional_wishlists(
+                    single_app_id.strip(),
+                    regions=single_regions,
+                    scan_limit=single_scan_limit,
+                )
+                st.session_state.single_purchase_wide = purchase_wide
+                st.session_state.single_purchase_long = purchase_long
+                st.session_state.single_wishlist_region = wishlist_region_df
+
+    gamalytic_error = st.session_state.get("single_gamalytic_error")
+    if gamalytic_error:
+        st.warning(f"Gamalytic countryData 暂时不可用：{gamalytic_error}")
+    gamalytic_pro_error = st.session_state.get("single_gamalytic_pro_error")
+    if gamalytic_pro_error:
+        st.warning(f"Gamalytic Pro Top20 数据暂时不可用：{gamalytic_pro_error}")
+
+    gamalytic_country_df = st.session_state.get("single_gamalytic_country_df")
+    gamalytic_summary_df = st.session_state.get("single_gamalytic_summary_df")
+    gamalytic_active_regions_df = st.session_state.get("single_gamalytic_active_regions_df")
+    gamalytic_wishlist_country_df = st.session_state.get("single_gamalytic_wishlist_country_df")
+    if gamalytic_summary_df is not None and not gamalytic_summary_df.empty:
+        st.markdown("##### Gamalytic Stats 摘要")
+        st.dataframe(gamalytic_summary_df, use_container_width=True, height=320)
+
+    if gamalytic_wishlist_country_df is not None and not gamalytic_wishlist_country_df.empty:
+        st.markdown("##### Wishlists by country Top20（Gamalytic Pro，愿望单国家分布）")
+        st.dataframe(gamalytic_wishlist_country_df, use_container_width=True)
+        fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=gamalytic_wishlist_country_df["国家/地区"],
+                    y=gamalytic_wishlist_country_df["愿望单占比(%)"],
+                    marker_color="#3fb950",
+                    text=gamalytic_wishlist_country_df["愿望单占比(%)"].map(lambda x: f"{x:.1f}%"),
+                    textposition="auto",
+                )
+            ]
+        )
+        layout = get_plotly_layout("Gamalytic Wishlists by country Top20")
+        layout.update(height=420, xaxis=dict(tickangle=-35, color="#8b949e"), yaxis=dict(range=[0, 100], color="#8b949e"))
+        fig.update_layout(**layout)
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("说明：该表来自 Gamalytic Pro 的 wishlist-insights 接口，展示愿望单国家分布 Top20；不会把 Top3 之外的国家合并成 Other。")
+    elif st.session_state.get("single_gamalytic_api_key", "").strip():
+        st.warning("已填写 Gamalytic API Key，但 wishlist-insights 没有返回可解析的国家愿望单 Top20。请确认该 Key 具备 Pro 权限。")
+    else:
+        st.info("愿望单国家 Top20 需要 Gamalytic Pro API Key。未填写 Key 时不会用公开 Top3+Other 伪造成愿望单国家分布。")
+
+    if gamalytic_active_regions_df is not None and not gamalytic_active_regions_df.empty:
+        st.markdown("##### Players by country Top20（Gamalytic Pro）")
+        st.dataframe(gamalytic_active_regions_df, use_container_width=True)
+        fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=gamalytic_active_regions_df["国家/地区"],
+                    y=gamalytic_active_regions_df["玩家占比(%)"],
+                    marker_color="#58a6ff",
+                    text=gamalytic_active_regions_df["玩家占比(%)"].map(lambda x: f"{x:.1f}%"),
+                    textposition="auto",
+                )
+            ]
+        )
+        layout = get_plotly_layout("Gamalytic Players by country Top20")
+        layout.update(height=420, xaxis=dict(tickangle=-35, color="#8b949e"), yaxis=dict(range=[0, 100], color="#8b949e"))
+        fig.update_layout(**layout)
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("说明：该数据来自 Gamalytic Pro 的 active-users-regions 接口，口径为 MAU 国家占比。")
+    elif gamalytic_country_df is not None and not gamalytic_country_df.empty:
+        st.markdown("##### Players by country（公开 Top3 + Other）")
+        st.dataframe(gamalytic_country_df, use_container_width=True)
+        fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=gamalytic_country_df["国家/地区"],
+                    y=gamalytic_country_df["玩家占比(%)"],
+                    marker_color="#58a6ff",
+                    text=gamalytic_country_df["玩家占比(%)"].map(lambda x: f"{x:.1f}%"),
+                    textposition="auto",
+                )
+            ]
+        )
+        layout = get_plotly_layout("Gamalytic Players by country")
+        layout.update(height=380, xaxis=dict(color="#8b949e"), yaxis=dict(range=[0, 100], color="#8b949e"))
+        fig.update_layout(**layout)
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("说明：该数据来自 Gamalytic 页面公开接口 game-details 的 countryData 字段，公开页面通常只给 Top3 + Other；不是 Top20。要展示至少 Top20，需要输入有 Pro 权限的 Gamalytic API Key。")
+    elif gamalytic_country_df is not None:
+        st.warning("Gamalytic 页面公开接口没有返回 countryData，无法展示 Players by country。")
+
+    purchase_wide = st.session_state.get("single_purchase_wide")
+    wishlist_region_df = st.session_state.get("single_wishlist_region")
+    if purchase_wide is not None and not purchase_wide.empty:
+        st.markdown("##### Steam 评论语言分布参考")
+        st.dataframe(purchase_wide, use_container_width=True)
+        market_cols = [c for c in purchase_wide.columns if c not in ["愿望单排名", "AppID", "游戏名称", "购买评论总样本"]]
+        if float(purchase_wide.iloc[0].get("购买评论总样本", 0)) <= 0:
+            st.warning("该游戏在所选评论口径和语言市场下没有评论样本。可以把口径切到 all，或增加语言市场。")
+        elif market_cols:
+            fig = go.Figure(data=[go.Bar(x=market_cols, y=[purchase_wide.iloc[0][c] for c in market_cols], marker_color="#58a6ff")])
+            layout = get_plotly_layout("Steam 评论语言分布参考")
+            layout.update(height=360, xaxis=dict(tickangle=-25, color="#8b949e"), yaxis=dict(range=[0, 100], color="#8b949e"))
+            fig.update_layout(**layout)
+            st.plotly_chart(fig, use_container_width=True)
+
+    if wishlist_region_df is not None and not wishlist_region_df.empty:
+        st.markdown("##### Steam 地区愿望单公开榜单诊断")
+        st.dataframe(wishlist_region_df, use_container_width=True)
+        if "区域信号状态" in wishlist_region_df.columns and (wishlist_region_df["区域信号状态"] == "无地区差异").all():
+            st.warning("Steam popularwishlist 地区榜单没有可用排名差异，不能据此估算真实愿望单玩家区域占比。Gamalytic 的 WISHLISTS BY COUNTRY 属于更深的 wishlist insights 数据，公开接口当前没有返回。")
+        chart_df = wishlist_region_df[wishlist_region_df.get("愿望单区域兴趣占比(%)", 0) > 0].copy()
+        if not chart_df.empty:
+            fig = go.Figure(data=[go.Bar(x=chart_df["地区"], y=chart_df["愿望单区域兴趣占比(%)"], marker_color="#3fb950")])
+            layout = get_plotly_layout("单游戏愿望单区域兴趣信号")
+            layout.update(height=360, xaxis=dict(color="#8b949e"), yaxis=dict(range=[0, 100], color="#8b949e"))
+            fig.update_layout(**layout)
+            st.plotly_chart(fig, use_container_width=True)
+
 # ============================================================
 # ★ 修复2：竞品覆盖检测函数（修正检测地址和判断逻辑）
 # ============================================================
@@ -784,12 +1351,14 @@ def check_flyy_coverage(game_name_en: str, game_name_cn: str = "") -> dict:
 # ============================================================
 # Session State 初始化
 # ============================================================
-for _k in ["fetch_results", "fetch_df", "last_app_id", "game_info", "supported_lang_codes", "all_supported_langs_text"]:
+for _k in ["fetch_results", "fetch_df", "last_app_id", "game_info", "supported_lang_codes", "all_supported_langs_text", "global_wishlist_df", "global_wishlist_total"]:
     if _k not in st.session_state: st.session_state[_k] = None
 if "ai_results" not in st.session_state: st.session_state["ai_results"] = {}
 if "comp_check_results" not in st.session_state: st.session_state["comp_check_results"] = {}
 for _k, _v in [("cfg_app_id","892970"),("cfg_preset","主流10语言"),("cfg_custom_langs",["schinese","english","russian","japanese"])]:
     if _k not in st.session_state: st.session_state[_k] = _v
+for _legacy_key in ["wishlist_df", "wishlist_country_df", "wishlist_errors", "wishlist_diagnosis", "cfg_steam_financial_api_key"]:
+    st.session_state.pop(_legacy_key, None)
 
 # ============================================================
 # 侧边栏
@@ -840,7 +1409,7 @@ if start_btn:
             status.update(label=f"{'✅' if tr>0 else '⚠️'} 抓取完成！{tr:,} 条 / {vc} 语言", state="complete", expanded=False)
 
 # Tab 布局
-tab1, tab2, tab3 = st.tabs(["📊 Tab1 基础评论分析", "🔍 Tab2 AI 需求挖掘", "📣 Tab3 推广策略辅助"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Tab1 基础评论分析", "🔍 Tab2 AI 需求挖掘", "📣 Tab3 推广策略辅助", "💙 Tab4 全站愿望单榜单"])
 
 # ============================================================
 # Tab 1
@@ -1201,6 +1770,12 @@ with tab3:
         if "promo" in st.session_state.ai_results:
             st.markdown("---\n##### 📣 各语言地区推广重点报告")
             st.markdown(f'<div class="analysis-card">{st.session_state.ai_results["promo"]}</div>', unsafe_allow_html=True)
+
+# ============================================================
+# Tab 4 - 全站愿望单榜单
+# ============================================================
+with tab4:
+    render_global_wishlist_tab()
 
 # 底部
 st.markdown("---")
